@@ -5,12 +5,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import h5py
 import torch
-from torch_brain.data import Dataset, collate
-from torch_brain.data.sampler import RandomFixedWindowSampler, SequentialFixedWindowSampler
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 from temporaldata import Data, IrregularTimeSeries
+from torch_brain.data import Dataset, collate
+from torch_brain.data.sampler import RandomFixedWindowSampler, SequentialFixedWindowSampler
+from torch_brain.data import Dataset, collate
 
 
 def move_to_device(data, device=None):
@@ -420,12 +421,6 @@ class Transform:
         data.units = data.units.select_by_mask(mask_units)
 
         return self.model.tokenize(data)
-
-
-from torch_brain.data.sampler import SequentialFixedWindowSampler
-from torch_brain.data import Dataset, collate
-from torch.utils.data import DataLoader
-from dev_functions import move_to_device
 
 
 def run_test(

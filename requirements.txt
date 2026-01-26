@@ -1,0 +1,13 @@
+pynwb
+dandi
+h5py
+numpy
+pandas
+temporaldata
+brainsets
+torch_brain
+torch
+torchmetrics
+tqdm
+matplotlib
+omegaconf
