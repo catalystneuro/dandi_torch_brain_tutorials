@@ -142,7 +142,7 @@ def plot_training_curves(r2_log, loss_log):
     plt.ylabel("MSE Loss")
     plt.grid()
     plt.subplot(1, 2, 2)
-    plt.plot(r2_log)
+    plt.plot(r2_log[1:])  # skip initial validation before training
     plt.title("Validation R2")
     plt.xlabel("Epochs")
     plt.ylabel("R2 Score")
@@ -458,7 +458,7 @@ def run_test(
     test_dataset.transform = Transform(model=model)
     
     model.eval()
-    targets, preds = [], []
+    targets, preds, r2_scores = [], [], []
     
     with torch.no_grad():
         for batch in test_loader:
@@ -475,101 +475,93 @@ def run_test(
                 if mask.dim() == 3 and mask.size(-1) == 1:
                     mask = mask.squeeze(-1)
     
-            targets.append(target[mask])
-            preds.append(pred[mask])
+            # Process each interval in the batch separately
+            batch_size = pred.shape[0]
+            for i in range(batch_size):
+                interval_pred = pred[i]      # Shape: [T]
+                interval_target = target[i]  # Shape: [T]
+                interval_mask = mask[i]      # Shape: [T]
+                
+                # Apply mask to get valid predictions and targets
+                masked_pred = interval_pred[interval_mask]
+                masked_target = interval_target[interval_mask]
+                
+                # Only calculate R² if we have valid data points
+                if len(masked_target) > 0:
+                    r2 = r2_score(masked_pred, masked_target)
+                    
+                    targets.append(masked_target)
+                    preds.append(masked_pred)
+                    r2_scores.append(r2.item())
 
-    return targets, preds
+    return targets, preds, r2_scores
 
 
-def plot_test_results_from_lists(
-    targets,
-    preds,
-    n_segments=5,
-    segment_len=1500,
-    seed=0,
-    title_prefix="Test",
-):
+def plot_test_intervals(targets, preds, r2_scores, n_intervals=5):
     """
-    Given lists of masked target/pred tensors from your test loop, this function:
-      1) concatenates them
-      2) computes overall R^2
-      3) plots n_segments random contiguous segments of length segment_len
-
+    Plots the top n_intervals with the highest R² scores.
+    
     Parameters
     ----------
-    targets, preds : list[torch.Tensor]
-        Each element is a 1D tensor produced by target[mask] and pred[mask].
-    n_segments : int
-        Number of random segments to plot.
-    segment_len : int
-        Number of samples per plotted segment (on the concatenated masked stream).
-    seed : int
-        RNG seed for reproducible segment selection.
-    title_prefix : str
-        Prefix for plot titles.
-
+    targets : list[torch.Tensor]
+        List of target tensors (one per batch).
+    preds : list[torch.Tensor]
+        List of prediction tensors (one per batch).
+    r2_scores : list[float]
+        List of R² scores (one per batch).
+    n_intervals : int, optional
+        Number of top-scoring intervals to plot (default=5).
+    
     Returns
     -------
-    r2 : float
-    y_true : torch.Tensor (1D, CPU)
-    y_pred : torch.Tensor (1D, CPU)
-    chosen_starts : list[int]
+    top_indices : list[int]
+        Indices of the top intervals that were plotted.
     """
-    import numpy as np
-    import torch
-    import matplotlib.pyplot as plt
-
-    def _r2_score_1d(y_pred_1d, y_true_1d):
-        y_true_mean = torch.mean(y_true_1d)
-        ss_total = torch.sum((y_true_1d - y_true_mean) ** 2)
-        ss_res = torch.sum((y_true_1d - y_pred_1d) ** 2)
-        # avoid divide-by-zero if signal is constant
-        if ss_total.item() == 0.0:
-            return torch.tensor(float("nan"), device=y_true_1d.device)
-        return 1 - ss_res / ss_total
-
-    # Concatenate and move to CPU for plotting
-    y_true = torch.cat([t.detach().flatten().cpu() for t in targets], dim=0)
-    y_pred = torch.cat([p.detach().flatten().cpu() for p in preds], dim=0)
-
-    r2 = _r2_score_1d(y_pred, y_true).item()
-
-    N = y_true.numel()
-    if N == 0:
-        raise ValueError("No samples found after masking. targets/preds are empty when concatenated.")
-
-    # Determine valid start positions
-    seg_len = int(segment_len)
-    if seg_len <= 10:
-        seg_len = min(200, N)  # sensible fallback
-    seg_len = min(seg_len, N)
-
-    max_start = N - seg_len
-    rng = np.random.default_rng(seed)
-
-    if max_start <= 0:
-        chosen_starts = [0]
-        n_plot = 1
-    else:
-        n_plot = min(int(n_segments), 20, max_start + 1)
-        chosen_starts = rng.choice(max_start + 1, size=n_plot, replace=False)
-        chosen_starts = sorted([int(s) for s in chosen_starts])
-
-    # Plot
-    plt.figure(figsize=(14, 2.8 * len(chosen_starts)))
-    for i, s in enumerate(chosen_starts, start=1):
-        e = s + seg_len
-        ax = plt.subplot(len(chosen_starts), 1, i)
-        ax.plot(y_true[s:e].numpy(), label="GT", linewidth=1.5)
-        ax.plot(y_pred[s:e].numpy(), label="Pred", linewidth=1.5)
-        ax.set_title(f"{title_prefix} segment {i}/{len(chosen_starts)} | idx {s}:{e} | overall R²={r2:.3f}")
-        ax.set_xlabel("Sample index (within segment)")
-        ax.set_ylabel("Wheel velocity (normalized)")
-        ax.grid(True)
-        if i == 1:
-            ax.legend()
-
+    # Get indices sorted by R² score (highest to lowest)
+    sorted_indices = np.argsort(r2_scores)[::-1]
+    
+    # Select top n_intervals
+    n_plot = min(n_intervals, len(r2_scores))
+    top_indices = sorted_indices[:n_plot]
+    
+    # Calculate overall statistics
+    mean_r2 = np.mean(r2_scores)
+    median_r2 = np.median(r2_scores)
+    
+    print(f"\n📊 Test Statistics Summary:")
+    print(f"   Mean R²: {mean_r2:.3f}")
+    print(f"   Median R²: {median_r2:.3f}")
+    print(f"   Min R²: {np.min(r2_scores):.3f}")
+    print(f"   Max R²: {np.max(r2_scores):.3f}")
+    print(f"\n   Plotting top {n_plot} intervals...\n")
+    
+    # Create subplots
+    fig, axes = plt.subplots(n_plot, 1, figsize=(14, 3 * n_plot))
+    
+    # Handle single subplot case
+    if n_plot == 1:
+        axes = [axes]
+    
+    for i, idx in enumerate(top_indices):
+        ax = axes[i]
+        
+        # Get data for this interval
+        y_true = targets[idx].detach().cpu().numpy().flatten()
+        y_pred = preds[idx].detach().cpu().numpy().flatten()
+        r2 = r2_scores[idx]
+        
+        # Plot
+        ax.plot(y_true, label="Ground Truth", linewidth=1.5, alpha=0.8)
+        ax.plot(y_pred, label="Prediction", linewidth=1.5, alpha=0.8)
+        
+        # Formatting
+        ax.set_title(f"Interval {i+1}/{n_plot} | Batch #{idx} | R² = {r2:.3f}", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Sample index", fontsize=10)
+        ax.set_ylabel("Value (normalized)", fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right')
+    
     plt.tight_layout()
     plt.show()
-
-    return r2, y_true, y_pred, chosen_starts
+    
+    return top_indices.tolist()
