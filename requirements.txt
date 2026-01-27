@@ -121,7 +121,7 @@ nvidia-nvtx-cu12==12.8.90
 nwbinspector==0.6.5
 omegaconf==2.3.0
 packaging==26.0
-pandas==3.0.0
+pandas==2.3.3
 parso==0.8.5
 pexpect==4.9.0
 pillow==12.1.0
