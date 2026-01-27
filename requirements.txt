@@ -168,7 +168,7 @@ tensorstore==0.1.80
 threadpoolctl==3.6.0
 tifffile==2026.1.14
 torch==2.10.0
-torch_brain==0.1.0
+git+https://github.com/neuro-galaxy/torch_brain.git@main
 torchmetrics==1.8.2
 torchtyping==0.1.5
 tornado==6.5.4

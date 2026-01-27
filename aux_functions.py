@@ -21,12 +21,15 @@ def download_model(local_path: str = None):
     """
     if local_path is None:
         local_path = "./poyo_1.ckpt"
-    local_path = Path(local_path)
+    local_path = Path(local_path).resolve()
     local_path.parent.mkdir(parents=True, exist_ok=True)
+    if local_path.exists():
+        print(f"File already exists at: {local_path}")
+        return
     
     #url = "https://nyu1.osn.mghpcc.org/brainsets-public/model-zoo/poyo_mp.ckpt"
     url = "https://nyu1.osn.mghpcc.org/brainsets-public/model-zoo/poyo_1.ckpt"
-    
+
     with requests.get(url, stream=True) as response:
         response.raise_for_status()
         with open(local_path, "wb") as f:
