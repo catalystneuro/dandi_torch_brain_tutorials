@@ -500,21 +500,19 @@ def run_test(
                     preds.append(masked_pred)
                     r2_scores.append(r2.item())
 
-    return targets, preds, r2_scores
+    return dict(targets=targets, preds=preds, r2_scores=r2_scores)
 
 
-def plot_test_intervals(targets, preds, r2_scores, n_intervals=5, order: Literal["top", "bottom"] = "top"):
+def plot_test_intervals(test_results, n_intervals=5, order: Literal["top", "bottom"] = "top"):
     """
     Plots the top/bottom n_intervals based on R² scores.
+    Supports both single-model and multi-model comparison.
     
     Parameters
     ----------
-    targets : list[torch.Tensor]
-        List of target tensors (one per interval).
-    preds : list[torch.Tensor]
-        List of prediction tensors (one per interval).
-    r2_scores : list[float]
-        List of R² scores (one per interval).
+    test_results : dict
+        Either a single model result dict with keys 'targets', 'preds', 'r2_scores',
+        or a dict of model results: {model_name: {targets, preds, r2_scores}, ...}
     n_intervals : int, optional
         Number of intervals to plot (default=5).
     order : Literal["top", "bottom"], optional
@@ -526,8 +524,26 @@ def plot_test_intervals(targets, preds, r2_scores, n_intervals=5, order: Literal
     top_indices : list[int]
         Indices of the intervals that were plotted.
     """
+    # Detect if single model or multi-model
+    is_multi_model = 'targets' not in test_results
+    
+    if is_multi_model:
+        model_names = list(test_results.keys())
+        
+        # Calculate average R² scores across models for ranking
+        all_r2_scores = [test_results[name]['r2_scores'] for name in model_names]
+        avg_r2_scores = np.mean(all_r2_scores, axis=0)
+        
+        # Use first model's targets (should be same for all)
+        targets = test_results[model_names[0]]['targets']
+    else:
+        model_names = ['model']
+        test_results = {'model': test_results}
+        avg_r2_scores = np.array(test_results['model']['r2_scores'])
+        targets = test_results['model']['targets']
+    
     # Filter out nan values before sorting
-    r2_array = np.array(r2_scores)
+    r2_array = np.array(avg_r2_scores)
     valid_mask = ~np.isnan(r2_array)
     valid_indices = np.where(valid_mask)[0]
     valid_r2_scores = r2_array[valid_indices]
@@ -556,17 +572,36 @@ def plot_test_intervals(targets, preds, r2_scores, n_intervals=5, order: Literal
     for i, idx in enumerate(top_indices):
         ax = axes[i]
         
-        # Get data for this interval
+        # Plot ground truth (same for all models)
         y_true = targets[idx].detach().cpu().numpy().flatten()
-        y_pred = preds[idx].detach().cpu().numpy().flatten()
-        r2 = r2_scores[idx]
+        ax.plot(y_true, label="Ground Truth", linewidth=2, alpha=0.9, color='black', linestyle='--')
         
-        # Plot
-        ax.plot(y_true, label="Ground Truth", linewidth=1.5, alpha=0.8)
-        ax.plot(y_pred, label="Prediction", linewidth=1.5, alpha=0.8)
+        # Plot predictions for each model
+        r2_parts = []
+        for model_name in model_names:
+            y_pred = test_results[model_name]['preds'][idx].detach().cpu().numpy().flatten()
+            r2 = test_results[model_name]['r2_scores'][idx]
+            
+            # Plot with label
+            label = f"{model_name}" if is_multi_model else "Prediction"
+            ax.plot(y_pred, label=label, linewidth=1.5, alpha=0.8)
+            
+            # Build R² string
+            if is_multi_model:
+                r2_parts.append(f"{model_name}: {r2:.3f}")
+            else:
+                r2_parts.append(f"{r2:.3f}")
+        
+        # Add average R² if multi-model
+        if is_multi_model:
+            avg_r2 = avg_r2_scores[idx]
+            r2_parts.append(f"avg: {avg_r2:.3f}")
+            title_text = f"R² - {' | '.join(r2_parts)}"
+        else:
+            title_text = f"R² = {r2_parts[0]}"
         
         # Formatting
-        ax.set_title(f"R² = {r2:.3f}", fontsize=12, fontweight='bold')
+        ax.set_title(title_text, fontsize=12, fontweight='bold')
         ax.set_xlabel("Sample index", fontsize=10)
         ax.set_ylabel("Value (normalized)", fontsize=10)
         ax.grid(True, alpha=0.3)
