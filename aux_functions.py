@@ -1,5 +1,6 @@
 from collections import defaultdict
 from pathlib import Path
+import requests
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,6 +13,27 @@ from temporaldata import Data, IrregularTimeSeries
 from torch_brain.data import Dataset, collate
 from torch_brain.data.sampler import RandomFixedWindowSampler, SequentialFixedWindowSampler
 from torch_brain.data import Dataset, collate
+
+
+def download_model(local_path: str = None):
+    """
+    Download a pre-trained model file and save it to `local_path`.
+    """
+    if local_path is None:
+        local_path = "./poyo_1.ckpt"
+    local_path = Path(local_path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    #url = "https://nyu1.osn.mghpcc.org/brainsets-public/model-zoo/poyo_mp.ckpt"
+    url = "https://nyu1.osn.mghpcc.org/brainsets-public/model-zoo/poyo_1.ckpt"
+    
+    with requests.get(url, stream=True) as response:
+        response.raise_for_status()
+        with open(local_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+    print(f"Downloaded file to: {local_path}")
 
 
 def move_to_device(data, device=None):
