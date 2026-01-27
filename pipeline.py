@@ -68,7 +68,7 @@ class Pipeline(BrainsetPipeline):
     @classmethod
     def get_manifest(cls, raw_dir, args) -> pd.DataFrame:
         # TODO: Implement manifest generation from DANDI
-        # For now, we keep just a simple manifest for local testing
+        # For now, we keep just a simple manifest, with few selected sessions
         manifest_list = [
             {
                 "session_id": "sub-NYU-21_ses-8c33abef-3d3e-4d42-9f27-445e9def08f9",
@@ -429,8 +429,7 @@ def extract_splits(
     interval_ref_time: str = "start_time",
     interval_max_duration: float | None = None,
 ):
-    """Extract splits for torch_brain."""
-    # Filter trials based on max_time, interval_ref_time, and optional max_duration
+    """Extract train, validation and test splits for torch_brain."""
     df = nwbfile.trials.to_dataframe()    
     df.rename(columns={interval_ref_time: "start", "stop_time": "end"}, inplace=True)
     df = df[df["end"] < max_time]
