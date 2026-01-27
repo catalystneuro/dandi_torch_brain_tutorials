@@ -1,5 +1,6 @@
 from collections import defaultdict
 from pathlib import Path
+from typing import Literal
 import requests
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -68,6 +69,11 @@ def r2_score(y_pred, y_true):
 
     # Compute residual sum of squares
     ss_res = torch.sum((y_true - y_pred) ** 2)
+
+    # Handle zero or near-zero variance
+    epsilon = 1e-2
+    if ss_total < epsilon:
+        return torch.tensor(float('nan'))
 
     # Compute R^2
     r2 = 1 - ss_res / ss_total
@@ -497,43 +503,48 @@ def run_test(
     return targets, preds, r2_scores
 
 
-def plot_test_intervals(targets, preds, r2_scores, n_intervals=5):
+def plot_test_intervals(targets, preds, r2_scores, n_intervals=5, order: Literal["top", "bottom"] = "top"):
     """
-    Plots the top n_intervals with the highest R² scores.
+    Plots the top/bottom n_intervals based on R² scores.
     
     Parameters
     ----------
     targets : list[torch.Tensor]
-        List of target tensors (one per batch).
+        List of target tensors (one per interval).
     preds : list[torch.Tensor]
-        List of prediction tensors (one per batch).
+        List of prediction tensors (one per interval).
     r2_scores : list[float]
-        List of R² scores (one per batch).
+        List of R² scores (one per interval).
     n_intervals : int, optional
-        Number of top-scoring intervals to plot (default=5).
+        Number of intervals to plot (default=5).
+    order : Literal["top", "bottom"], optional
+        Which intervals to plot. "top" shows best performers (default),
+        "bottom" shows worst performers.
     
     Returns
     -------
     top_indices : list[int]
-        Indices of the top intervals that were plotted.
+        Indices of the intervals that were plotted.
     """
-    # Get indices sorted by R² score (highest to lowest)
-    sorted_indices = np.argsort(r2_scores)[::-1]
+    # Filter out nan values before sorting
+    r2_array = np.array(r2_scores)
+    valid_mask = ~np.isnan(r2_array)
+    valid_indices = np.where(valid_mask)[0]
+    valid_r2_scores = r2_array[valid_indices]
     
-    # Select top n_intervals
-    n_plot = min(n_intervals, len(r2_scores))
+    # Sort valid indices by their R² scores based on order
+    if order == "top":
+        # Highest to lowest (best performers)
+        sorted_order = np.argsort(valid_r2_scores)[::-1]
+    else:  # bottom
+        # Lowest to highest (worst performers)
+        sorted_order = np.argsort(valid_r2_scores)
+    
+    sorted_indices = valid_indices[sorted_order]
+    
+    # Select top n_intervals from valid intervals only
+    n_plot = min(n_intervals, len(sorted_indices))
     top_indices = sorted_indices[:n_plot]
-    
-    # Calculate overall statistics
-    mean_r2 = np.mean(r2_scores)
-    median_r2 = np.median(r2_scores)
-    
-    print(f"\n📊 Test Statistics Summary:")
-    print(f"   Mean R²: {mean_r2:.3f}")
-    print(f"   Median R²: {median_r2:.3f}")
-    print(f"   Min R²: {np.min(r2_scores):.3f}")
-    print(f"   Max R²: {np.max(r2_scores):.3f}")
-    print(f"\n   Plotting top {n_plot} intervals...\n")
     
     # Create subplots
     fig, axes = plt.subplots(n_plot, 1, figsize=(14, 3 * n_plot))
@@ -555,7 +566,7 @@ def plot_test_intervals(targets, preds, r2_scores, n_intervals=5):
         ax.plot(y_pred, label="Prediction", linewidth=1.5, alpha=0.8)
         
         # Formatting
-        ax.set_title(f"Interval {i+1}/{n_plot} | Batch #{idx} | R² = {r2:.3f}", fontsize=12, fontweight='bold')
+        ax.set_title(f"R² = {r2:.3f}", fontsize=12, fontweight='bold')
         ax.set_xlabel("Sample index", fontsize=10)
         ax.set_ylabel("Value (normalized)", fontsize=10)
         ax.grid(True, alpha=0.3)
@@ -563,5 +574,3 @@ def plot_test_intervals(targets, preds, r2_scores, n_intervals=5):
     
     plt.tight_layout()
     plt.show()
-    
-    return top_indices.tolist()
