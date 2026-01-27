@@ -90,6 +90,8 @@ class Pipeline(BrainsetPipeline):
         self.update_status("DOWNLOADING")
         filepath = self.raw_dir / manifest_item.filename
 
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
+
         # Connect to DANDI and get the dandiset asset
         dandiset_id = "000409"
         client = DandiAPIClient()
@@ -112,6 +114,8 @@ class Pipeline(BrainsetPipeline):
         session_id = fpath.stem
         store_path = self.processed_dir / f"{session_id}.h5"
 
+        self.processed_dir.mkdir(exist_ok=True, parents=True)
+
         if store_path.exists() and not self.args.reprocess:
             self.update_status("Skipped Processing")
             return
@@ -119,8 +123,6 @@ class Pipeline(BrainsetPipeline):
         # Open NWB file
         io = NWBHDF5IO(str(fpath), "r")
         nwbfile = io.read()
-
-        self.processed_dir.mkdir(exist_ok=True, parents=True)
 
         # Extract metadata
         self.update_status("Extracting Metadata")
