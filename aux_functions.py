@@ -31,10 +31,11 @@ def download_model(local_path: str = None):
     #url = "https://nyu1.osn.mghpcc.org/brainsets-public/model-zoo/poyo_mp.ckpt"
     url = "https://nyu1.osn.mghpcc.org/brainsets-public/model-zoo/poyo_1.ckpt"
 
+    print("Downloading model...")
     with requests.get(url, stream=True) as response:
         response.raise_for_status()
         with open(local_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
+            for chunk in response.iter_content(chunk_size=16384):
                 if chunk:
                     f.write(chunk)
     print(f"Downloaded file to: {local_path}")
@@ -384,13 +385,13 @@ def get_loaders(
     )
 
 
-def get_unit_ids(dataset, filter_str="motor"):
+def get_unit_ids(dataset, filter_str=["motor"]):
     unit_ids_list = []
     for k in dataset.recording_dict.keys():
         data = dataset.get_recording_data(k)
         valid_ids = list()
         for i, ln in zip(data.units.id, data.units.location_names):
-            if filter_str in ln.lower():
+            if any(fs in ln.lower() for fs in filter_str):
                 valid_ids.append(i)
         unit_ids_list.extend(valid_ids)
     return unit_ids_list
