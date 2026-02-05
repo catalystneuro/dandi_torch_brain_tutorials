@@ -385,13 +385,35 @@ def get_loaders(
     )
 
 
-def get_unit_ids(dataset, filter_str=["motor"]):
+def get_unit_ids(
+    dataset,
+    filter_str=["motor"],
+    quality_score: float = 0.6,
+):
+    """
+    Get unit IDs filtered by location names and quality score.
+    
+    Parameters
+    ----------
+    dataset : Dataset
+        The dataset containing recording data.
+    filter_str : list[str], optional
+        List of strings to filter location names (default: ["motor"]).
+    quality_score : float, optional
+        Minimum IBL quality score threshold (default: 0.6).
+    
+    Returns
+    -------
+    list
+        List of filtered unit IDs.
+    """
     unit_ids_list = []
     for k in dataset.recording_dict.keys():
         data = dataset.get_recording_data(k)
         valid_ids = list()
-        for i, ln in zip(data.units.id, data.units.location_names):
-            if any(fs in ln.lower() for fs in filter_str):
+        for i, ln, qs in zip(data.units.id, data.units.location_names, data.units.ibl_quality_score):
+            # Filter by location name and quality score
+            if any(fs in ln.lower() for fs in filter_str) and qs > quality_score:
                 valid_ids.append(i)
         unit_ids_list.extend(valid_ids)
     return unit_ids_list
