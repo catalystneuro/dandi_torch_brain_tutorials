@@ -82,6 +82,43 @@ class Pipeline(BrainsetPipeline):
                 "session_id": "sub-UCLA035_ses-6f36868f-5cc1-450c-82fa-6b9829ce0cfe",
                 "filename": "sub-UCLA035_ses-6f36868f-5cc1-450c-82fa-6b9829ce0cfe_desc-processed_behavior+ecephys.nwb",
             },
+            {
+                "session_id": "sub-DY-011_ses-7bee9f09-a238-42cf-b499-f51f765c6ded",
+                "filename": "sub-DY-011_ses-7bee9f09-a238-42cf-b499-f51f765c6ded_desc-processed_behavior+ecephys.nwb",
+            },
+            {
+                "session_id": "sub-DY-014_ses-bd456d8f-d36e-434a-8051-ff3997253802",
+                "filename": "sub-DY-014_ses-bd456d8f-d36e-434a-8051-ff3997253802_desc-processed_behavior+ecephys.nwb",
+            },
+            {
+                "session_id": "sub-NR-0027_ses-ae8787b1-4229-4d56-b0c2-566b61a25b77",
+                "filename": "sub-NR-0027_ses-ae8787b1-4229-4d56-b0c2-566b61a25b77_desc-processed_behavior+ecephys.nwb",
+            },
+            {
+                "session_id": "sub-SWC-038_ses-03063955-2523-47bd-ae57-f7489dd40f15",
+                "filename": "sub-SWC-038_ses-03063955-2523-47bd-ae57-f7489dd40f15_desc-processed_behavior+ecephys.nwb",
+            },
+            {
+                "session_id": "sub-ZFM-01936_ses-4aa1d525-5c7d-4c50-a147-ec53a9014812",
+                "filename": "sub-ZFM-01936_ses-4aa1d525-5c7d-4c50-a147-ec53a9014812_desc-processed_behavior+ecephys.nwb",
+            },
+            # same subject, different sessions
+            {
+                "session_id": "sub-CSH-ZAD-026_ses-81a78eac-9d36-4f90-a73a-7eb3ad7f770b",
+                "filename": "sub-CSH-ZAD-026_ses-81a78eac-9d36-4f90-a73a-7eb3ad7f770b_desc-processed_behavior+ecephys.nwb",
+            },
+            {
+                "session_id": "sub-CSH-ZAD-026_ses-626126d5-eecf-4e9b-900e-ec29a17ece07",
+                "filename": "sub-CSH-ZAD-026_ses-626126d5-eecf-4e9b-900e-ec29a17ece07_desc-processed_behavior+ecephys.nwb",
+            },
+            {
+                "session_id": "sub-CSH-ZAD-026_ses-b69b86be-af7d-4ecf-8cbf-0cd356afa1bd",
+                "filename": "sub-CSH-ZAD-026_ses-b69b86be-af7d-4ecf-8cbf-0cd356afa1bd_desc-processed_behavior+ecephys.nwb",
+            },
+            {
+                "session_id": "sub-CSH-ZAD-026_ses-e56541a5-a6d5-4750-b1fe-f6b5257bfe7c",
+                "filename": "sub-CSH-ZAD-026_ses-e56541a5-a6d5-4750-b1fe-f6b5257bfe7c_desc-processed_behavior+ecephys.nwb",
+            },
         ]
         manifest = pd.DataFrame(manifest_list).set_index("session_id")
         return manifest
@@ -254,7 +291,8 @@ def extract_units_and_spikes(nwbfile: NWBFile, max_time: float):
     for i, r in units_df.iterrows():
         # Get electrodes with peak waveform values
         waveform_peaks = np.max(np.abs(r["waveform_mean"]), axis=0)
-        sorted_peaks = np.argsort(waveform_peaks)[::-1]
+        valid = ~np.isnan(waveform_peaks)
+        sorted_peaks = np.argsort(waveform_peaks[valid])[::-1]
         top_sorted_peak = sorted_peaks[0]
         # Get the most common locations for the peak signal electrodes
         top_location = r["electrodes"]["location"].values[top_sorted_peak]
