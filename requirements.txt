@@ -132,7 +132,7 @@ python-dotenv==1.2.1
 pytz==2025.2
 PyYAML==6.0.3
 pyzmq==27.1.0
-ray==2.53.0
+ray==2.54.0
 referencing==0.37.0
 requests==2.32.5
 rfc3339-validator==0.1.4
