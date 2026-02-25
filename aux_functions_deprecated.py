@@ -1,7 +1,6 @@
 from collections import defaultdict
-from copy import deepcopy
 from pathlib import Path
-from typing import Callable, Literal, Optional
+from typing import Literal
 import requests
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -10,80 +9,12 @@ import h5py
 import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+from omegaconf import OmegaConf
 from temporaldata import Data, IrregularTimeSeries
-from torch_brain.dataset import Dataset, SpikingDatasetMixin
-from torch_brain.data import collate
+from torch_brain.data import Dataset, collate
 from torch_brain.data.sampler import RandomFixedWindowSampler, SequentialFixedWindowSampler
+from torch_brain.data import Dataset, collate
 
-
-class IBLBrainWideMapDataset(SpikingDatasetMixin, Dataset):
-    """Dataset for IBL Brain Wide Map data:
-    - wraps the IBL processed HDF5 files
-    - injects a readout config (normalization stats, readout_id) into each 
-      recording via `get_recording_hook`.
-
-    Args:
-        root: Root directory containing the ``ibl_processed/`` subdirectory.
-        readout_id: Name of the readout modality (e.g. ``"wheel_velocity"``).
-        normalize_mean: Mean value used for output normalization.
-        normalize_std: Std deviation used for output normalization.
-        recording_ids: Optional list of recording IDs (h5 file stems) to include.
-            If ``None``, all ``*.h5`` files in the dataset directory are used.
-        transform: Optional transform applied.
-        dirname: Subdirectory name under ``root`` where the h5 files live.
-            Defaults to ``"ibl_processed"``.
-    """
-
-    def __init__(
-        self,
-        root: str,
-        readout_id: str,
-        normalize_mean: float,
-        normalize_std: float,
-        recording_ids: Optional[list[str]] = None,
-        transform: Optional[Callable] = None,
-        dirname: str = "ibl_processed",
-        **kwargs,
-    ):
-        self._readout_config = {
-            "readout": {
-                "readout_id": readout_id,
-                "timestamp_key": f"{readout_id}.timestamps",
-                "value_key": f"{readout_id}.values",
-                "normalize_mean": normalize_mean,
-                "normalize_std": normalize_std,
-            }
-        }
-        super().__init__(
-            dataset_dir=Path(root) / dirname,
-            recording_ids=recording_ids,
-            transform=transform,
-            namespace_attributes=["session.id", "subject.id", "units.id"],
-            **kwargs,
-        )
-        # Prefix every unit ID with its session ID to ensure global uniqueness
-        self.spiking_dataset_mixin_uniquify_unit_ids = True
-
-    def get_recording_hook(self, data: Data):
-        """Inject readout config into every loaded recording."""
-        data.config = deepcopy(self._readout_config)
-        super().get_recording_hook(data)
-
-    def get_sampling_intervals(
-        self,
-        split: Optional[Literal["train", "valid", "test"]] = None,
-    ):
-        """Return per-recording sampling intervals, optionally filtered by split."""
-        domain_key = "domain" if split is None else f"{split}_domain"
-        return {
-            rid: getattr(self.get_recording(rid), domain_key)
-            for rid in self.recording_ids
-        }
-
-
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
 
 def download_model(local_path: str = None):
     """
@@ -97,6 +28,7 @@ def download_model(local_path: str = None):
         print(f"File already exists at: {local_path}")
         return
     
+    #url = "https://nyu1.osn.mghpcc.org/brainsets-public/model-zoo/poyo_mp.ckpt"
     url = "https://nyu1.osn.mghpcc.org/brainsets-public/model-zoo/poyo_1.ckpt"
 
     print("Downloading model...")
@@ -107,41 +39,6 @@ def download_model(local_path: str = None):
                 if chunk:
                     f.write(chunk)
     print(f"Downloaded file to: {local_path}")
-
-
-def compute_normalization_stats(
-    dir_path: str,
-    recording_ids: list[str],
-    readout_id: str,
-    dirname: str = "ibl_processed",
-) -> tuple[float, float]:
-    """Compute mean and std of a readout signal over training data.
-
-    Scans the h5 files for each recording in ``recording_ids`` and computes
-    descriptive stats from the ``train_domain`` portion of the data.
-
-    Args:
-        dir_path: Root directory containing the dataset subdirectory.
-        recording_ids: List of recording IDs (h5 file stems) to scan.
-        readout_id: Attribute path to the readout signal (e.g. ``"wheel_velocity"``).
-        dirname: Subdirectory name under ``dir_path``.
-
-    Returns:
-        ``(mean, std)`` as floats.
-    """
-    values = np.array([])
-    for rid in recording_ids:
-        session_path = Path(dir_path) / dirname / f"{rid}.h5"
-        with h5py.File(session_path, "r") as f:
-            session_data = Data.from_hdf5(f, lazy=True)
-            train = session_data.select_by_interval(session_data.train_domain)
-            attr = train
-            for part in readout_id.split("."):
-                attr = getattr(attr, part)
-            if hasattr(attr, "values"):
-                attr = attr.values
-            values = np.append(values, np.asarray(attr))
-    return float(np.nanmean(values)), float(np.nanstd(values))
 
 
 def move_to_device(data, device=None):
@@ -345,173 +242,188 @@ def finetune(model, optimizer, train_loader, val_loader, num_epochs=50, epoch_to
     return r2_log, loss_log, train_outputs
 
 
+def get_dataset_config(brainset, readout_id, session_ids=None):
+    all_sessions = [f.resolve() for f in Path(brainset).glob("*.h5")]
+    if session_ids is not None:
+        all_sessions = [s for s in all_sessions if s.name in session_ids]
+    values = np.array([])
+    for session_path in all_sessions:
+        with h5py.File(session_path, "r") as f:
+            session_data = Data.from_hdf5(f, lazy=True)
+            train = session_data.select_by_interval(session_data.train_domain)
+            values = np.append(values, getattr(train, readout_id).values)
+    mean_val = np.nanmean(values)
+    std_val = np.nanstd(values)
+
+    session_names = [s.name.split(".h5")[0] for s in all_sessions]
+    sessions_yaml = '\n'.join([f'          - {name}' for name in session_names])
+
+    config = f"""
+    - selection:
+      - brainset: {brainset}
+        sessions:
+{sessions_yaml}
+      config:
+        readout:
+          readout_id: {readout_id}
+          timestamp_key: {readout_id}.timestamps
+          value_key: {readout_id}.values
+          normalize_mean: {mean_val}
+          normalize_std: {std_val}
+          metrics:
+            - metric:
+                _target_: torchmetrics.R2Score
+    """
+    config = OmegaConf.create(config)
+    return config
+
+
 def get_loaders(
     dir_path: str = ".",
-    recording_ids: list[str] = None,
-    readout_id: str = "wheel_velocity",
-    window_length: float = 1.0,
-    batch_size: int = 16,
-    seed: int = 0,
+    recording_id=None,
+    cfg=None,
+    window_length=1.0,
+    batch_size=16,
+    seed=0,
     device=None,
-    dirname: str = "ibl_processed",
 ):
-    """Set up a single Dataset and three DataLoaders (train / val / test).
-
-    A *single* :class:`IBLBrainWideMapDataset` instance is created and shared
-    across all three DataLoaders.  Each loader obtains its own sampler built
-    from the appropriate split intervals (``"train"``, ``"valid"``, ``"test"``).
-
-    The dataset's ``transform`` attribute can be swapped in-place at any time
-    (e.g. ``dataset.transform = Transform(model)``); the change automatically
-    affects all three loaders.
-
-    Args:
-        dir_path: Root directory containing the dataset subdirectory.
-        recording_ids: List of h5 file stems to include. Must be provided.
-        readout_id: Name of the readout modality (e.g. ``"wheel_velocity"``).
-        window_length: Sliding-window length in seconds.
-        batch_size: Samples per batch.
-        seed: Random seed for the training sampler.
-        device: Target device.  Used only to decide multiprocessing settings.
-        dirname: Subdirectory name under ``dir_path`` where h5 files live.
-
-    Returns:
-        ``(dataset, train_loader, val_loader, test_loader)``
-    """
-    if recording_ids is None:
-        raise ValueError("recording_ids must be provided.")
-
-    # Decide multiprocessing / pin-memory settings based on device
+    """Sets up train and validation Datasets, Samplers, and DataLoaders"""
+    # sensible defaults
     use_multiproc = True
     use_pin_memory = True
     if device is None:
-        device = (
-            torch.device("mps") if torch.backends.mps.is_available()
-            else torch.device("cuda:0") if torch.cuda.is_available()
-            else torch.device("cpu")
+        device = torch.device("mps") if torch.backends.mps.is_available() else (
+            torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         )
-    # On Apple MPS avoid multiprocessing/pinned memory to prevent _share_filename_ errors
+    # On Apple MPS, avoid multiprocessing/pinned memory to prevent _share_filename_ errors
     if device.type == "mps":
         use_multiproc = False
         use_pin_memory = False
 
-    # Compute normalization statistics from the training portion of the data
-    normalize_mean, normalize_std = compute_normalization_stats(
-        dir_path=dir_path,
-        recording_ids=recording_ids,
-        readout_id=readout_id,
-        dirname=dirname,
-    )
-
-    # A single dataset instance shared by all three loaders
-    dataset = IBLBrainWideMapDataset(
+    # -- Train --
+    train_dataset = Dataset(
         root=dir_path,
-        readout_id=readout_id,
-        normalize_mean=normalize_mean,
-        normalize_std=normalize_std,
-        recording_ids=recording_ids,
-        dirname=dirname,
+        recording_id=recording_id,
+        config=cfg,
+        split="train",
     )
-
-    num_workers = 0 if not use_multiproc else 4
-
+    # We use a random sampler to improve generalization during training
+    train_sampling_intervals = train_dataset.get_sampling_intervals()
     train_sampler = RandomFixedWindowSampler(
-        sampling_intervals=dataset.get_sampling_intervals("train"),
+        sampling_intervals=train_sampling_intervals,
         window_length=window_length,
         generator=torch.Generator().manual_seed(seed),
     )
+    # Finally combine them in a dataloader
     train_loader = DataLoader(
-        dataset=dataset,
-        sampler=train_sampler,
-        batch_size=batch_size,
-        collate_fn=collate,
-        num_workers=num_workers,
+        dataset=train_dataset,      # dataset
+        sampler=train_sampler,      # sampler
+        batch_size=batch_size,      # num of samples per batch
+        collate_fn=collate,         # the collator
+        num_workers=0 if not use_multiproc else 4,    # data sample processing (slicing, transforms, tokenization) happens in parallel; this sets the amount of that parallelization
         pin_memory=use_pin_memory,
-        persistent_workers=False,
+        persistent_workers=False,   # important on macOS
     )
 
+    # -- Validation --
+    val_dataset = Dataset(
+        root=dir_path,
+        recording_id=recording_id,
+        config=cfg,
+        split="valid",
+    )
+    # For validation we don't randomize samples for reproducibility
+    val_sampling_intervals = val_dataset.get_sampling_intervals()
     val_sampler = SequentialFixedWindowSampler(
-        sampling_intervals=dataset.get_sampling_intervals("valid"),
+        sampling_intervals=val_sampling_intervals,
         window_length=window_length,
     )
+    # Combine them in a dataloader
     val_loader = DataLoader(
-        dataset=dataset,
+        dataset=val_dataset,
         sampler=val_sampler,
         batch_size=batch_size,
         collate_fn=collate,
-        num_workers=num_workers,
+        num_workers=0 if not use_multiproc else 4,
         pin_memory=use_pin_memory,
         persistent_workers=False,
     )
 
+    # -- Test --
+    test_dataset = Dataset(
+        root=dir_path,
+        recording_id=recording_id,
+        config=cfg,
+        split="test",
+    )
+    test_sampling_intervals = test_dataset.get_sampling_intervals()
     test_sampler = SequentialFixedWindowSampler(
-        sampling_intervals=dataset.get_sampling_intervals("test"),
+        sampling_intervals=test_sampling_intervals,
         window_length=window_length,
     )
     test_loader = DataLoader(
-        dataset=dataset,
+        dataset=test_dataset,
         sampler=test_sampler,
         batch_size=batch_size,
         collate_fn=collate,
-        num_workers=num_workers,
+        num_workers=0 if not use_multiproc else 4,
         pin_memory=use_pin_memory,
         persistent_workers=False,
     )
 
-    return dataset, train_loader, val_loader, test_loader
+    train_dataset.disable_data_leakage_check()
+    val_dataset.disable_data_leakage_check()
+    test_dataset.disable_data_leakage_check()
+
+    return (
+        train_dataset,
+        train_loader,
+        val_dataset,
+        val_loader,
+        test_dataset,
+        test_loader,
+    )
 
 
 def get_unit_ids(
-    dataset: IBLBrainWideMapDataset,
-    filter_str: list[str] = ["motor"],
+    dataset,
+    filter_str=["motor"],
     quality_score: float = 0.6,
-) -> list:
-    """Return unit IDs filtered by brain-area location name and quality score.
-
+):
+    """
+    Get unit IDs filtered by location names and quality score.
+    
     Parameters
     ----------
-    dataset:
-        An :class:`IBLBrainWideMapDataset` instance.
-    filter_str:
-        List of strings matched (case-insensitive) against ``units.location_names``.
-    quality_score:
-        Minimum IBL quality score threshold.
-
+    dataset : Dataset
+        The dataset containing recording data.
+    filter_str : list[str], optional
+        List of strings to filter location names (default: ["motor"]).
+    quality_score : float, optional
+        Minimum IBL quality score threshold (default: 0.6).
+    
     Returns
     -------
     list
-        Filtered and sorted unit IDs (already prefixed with ``session_id/``
-        by ``spiking_dataset_mixin_uniquify_unit_ids``).
+        List of filtered unit IDs.
     """
     unit_ids_list = []
-    for rid in dataset.recording_ids:
-        data = dataset.get_recording(rid)
-        valid_ids = [
-            i
-            for i, ln, qs in zip(
-                data.units.id,
-                data.units.location_names,
-                data.units.ibl_quality_score,
-            )
-            if any(fs in ln.lower() for fs in filter_str) and qs > quality_score
-        ]
+    for k in dataset.recording_dict.keys():
+        data = dataset.get_recording_data(k)
+        valid_ids = list()
+        for i, ln, qs in zip(data.units.id, data.units.location_names, data.units.ibl_quality_score):
+            # Filter by location name and quality score
+            if any(fs in ln.lower() for fs in filter_str) and qs > quality_score:
+                valid_ids.append(i)
         unit_ids_list.extend(valid_ids)
     return unit_ids_list
 
 
 class Transform:
-    """Filter spikes to a pre-defined set of units and tokenize for the model.
-
-    Parameters
-    ----------
-    model:
-        A POYO model whose ``unit_emb.vocab`` defines the set of known units.
-    """
-
     def __init__(self, model):
         self.model = model
         
-        # Precompute valid unit indices (integer part) per session prefix
+        # Precompute valid units per brainset/session
         out = defaultdict(list)
         for k in model.unit_emb.vocab:
             if k == 'NA':
@@ -522,7 +434,22 @@ class Transform:
         self.valid_units_per_recording = dict(out)
         
     def __call__(self, data):
-        """Filter spikes to vocab units and tokenize."""
+        """Filters data to use only spikes from motor areas."""
+
+        ## Deprecated code for filtering based on filter_str ---------------------
+        # unit_ids = data.units.id
+        # spike_unit_index = data.spikes.unit_index
+        # spike_timestamps = data.spikes.timestamps
+
+        # valid_idx = list()
+        # for idx, ln in zip(data.units.id, data.units.location_names):
+        #     if self.filter_str in ln.lower():
+        #         valid_idx.append(idx.split("_")[-1])  # keep only the numeric part
+
+        # valid_idx = np.array(valid_idx)
+        # mask = np.isin(spike_unit_index, valid_idx)
+        ##-----------------------------------------------------------------------
+
         valid_units = self.valid_units_per_recording.get(data.session.id, [])
         
         # Filter spikes
@@ -538,7 +465,7 @@ class Transform:
         
         data.spikes = IrregularTimeSeries(
             timestamps=spike_timestamps[mask_spikes],
-            unit_index=remapped_indices,
+            unit_index=remapped_indices,  # <-- Use remapped indices!
             domain="auto",
         )
 
@@ -551,25 +478,13 @@ class Transform:
 
 
 def run_test(
-    dataset: IBLBrainWideMapDataset,
-    test_loader: DataLoader,
+    test_dataset,
+    test_loader,
     model,
     device=None,
 ):
-    """Run inference on the test set and collect per-interval R² scores.
-
-    Args:
-        dataset: The shared dataset instance.  Its ``transform`` will be
-            replaced with a :class:`Transform` for ``model``.
-        test_loader: DataLoader using the test split sampler.
-        model: Finetuned POYO model.
-        device: Torch device.
-
-    Returns:
-        dict with keys ``targets``, ``preds``, and ``r2_scores``.
-    """
-    # Attach the model's tokenizer/filter as the dataset transform
-    dataset.transform = Transform(model=model)
+    # Connect tokenizers to Datasets
+    test_dataset.transform = Transform(model=model)
     
     model.eval()
     targets, preds, r2_scores = [], [], []
@@ -592,15 +507,18 @@ def run_test(
             # Process each interval in the batch separately
             batch_size = pred.shape[0]
             for i in range(batch_size):
-                interval_pred   = pred[i]
-                interval_target = target[i]
-                interval_mask   = mask[i]
+                interval_pred = pred[i]      # Shape: [T]
+                interval_target = target[i]  # Shape: [T]
+                interval_mask = mask[i]      # Shape: [T]
                 
-                masked_pred   = interval_pred[interval_mask]
+                # Apply mask to get valid predictions and targets
+                masked_pred = interval_pred[interval_mask]
                 masked_target = interval_target[interval_mask]
                 
+                # Only calculate R² if we have valid data points
                 if len(masked_target) > 0:
                     r2 = r2_score(masked_pred, masked_target)
+                    
                     targets.append(masked_target)
                     preds.append(masked_pred)
                     r2_scores.append(r2.item())
@@ -655,8 +573,10 @@ def plot_test_intervals(test_results, n_intervals=5, order: Literal["top", "bott
     
     # Sort valid indices by their R² scores based on order
     if order == "top":
+        # Highest to lowest (best performers)
         sorted_order = np.argsort(valid_r2_scores)[::-1]
     else:  # bottom
+        # Lowest to highest (worst performers)
         sorted_order = np.argsort(valid_r2_scores)
     
     sorted_indices = valid_indices[sorted_order]
@@ -685,9 +605,11 @@ def plot_test_intervals(test_results, n_intervals=5, order: Literal["top", "bott
             y_pred = test_results[model_name]['preds'][idx].detach().cpu().numpy().flatten()
             r2 = test_results[model_name]['r2_scores'][idx]
             
+            # Plot with label
             label = f"{model_name}" if is_multi_model else "Prediction"
             ax.plot(y_pred, label=label, linewidth=1.5, alpha=0.8)
             
+            # Build R² string
             if is_multi_model:
                 r2_parts.append(f"{model_name}: {r2:.3f}")
             else:
