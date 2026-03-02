@@ -185,6 +185,28 @@ def r2_score(y_pred, y_true):
     return r2
 
 
+def pearson_r(y_pred, y_true):
+    """Compute the Pearson correlation coefficient between two 1-D tensors.
+
+    Returns ``NaN`` when either signal has near-zero variance (e.g. a quiet
+    window where the mouse is stationary), rather than producing the large
+    negative values that R² can produce in those cases.
+
+    Args:
+        y_pred: Predicted values, shape ``(N,)``.
+        y_true: Ground-truth values, shape ``(N,)``.
+
+    Returns:
+        Scalar tensor in ``[-1, 1]``, or ``NaN`` if variance is too low.
+    """
+    pred_z   = y_pred - y_pred.mean()
+    true_z   = y_true - y_true.mean()
+    denom    = pred_z.norm() * true_z.norm()
+    if denom < 1e-6:
+        return torch.tensor(float("nan"))
+    return (pred_z * true_z).sum() / denom
+
+
 def compute_r2(dataloader, model):
     model.eval()  # turn off dropout, etc.
     total_target = []
@@ -693,13 +715,10 @@ def plot_test_intervals(test_results, n_intervals=5, order: Literal["top", "bott
             else:
                 r2_parts.append(f"{r2:.3f}")
         
-        # Add average R² if multi-model
         if is_multi_model:
-            avg_r2 = avg_r2_scores[idx]
-            r2_parts.append(f"avg: {avg_r2:.3f}")
-            title_text = f"R² - {' | '.join(r2_parts)}"
+            title_text = f"r - {' | '.join(r2_parts)}"
         else:
-            title_text = f"R² = {r2_parts[0]}"
+            title_text = f"r = {r2_parts[0]}"
         
         # Formatting
         ax.set_title(title_text, fontsize=12, fontweight='bold')
