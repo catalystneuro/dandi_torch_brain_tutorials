@@ -72,13 +72,25 @@ class IBLBrainWideMapDataset(SpikingDatasetMixin, Dataset):
     def get_sampling_intervals(
         self,
         split: Optional[Literal["train", "valid", "test"]] = None,
+        task: Optional[Literal["stimulus_side", "stimulus_contrast", "choice", "reward", "wheel_movement"]] = None,
     ):
-        """Return per-recording sampling intervals, optionally filtered by split."""
+        """Return per-recording sampling intervals, optionally filtered by split and task.
+
+        If ``task`` is provided, the returned intervals are the intersection of
+        the split domain with ``task_aligned_intervals.<task>`` for each
+        recording.  The sampler will then only draw windows from within those
+        task-aligned portions of the selected split.
+        """
         domain_key = "domain" if split is None else f"{split}_domain"
-        return {
-            rid: getattr(self.get_recording(rid), domain_key)
-            for rid in self.recording_ids
-        }
+        result = {}
+        for rid in self.recording_ids:
+            recording = self.get_recording(rid)
+            domain = getattr(recording, domain_key)
+            if task is not None:
+                task_interval = getattr(recording.task_aligned_intervals, task)
+                domain = domain & task_interval
+            result[rid] = domain
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +383,7 @@ def get_loaders(
     dir_path: str = ".",
     recording_ids: list[str] = None,
     readout_id: str = "wheel_velocity",
+    task: Optional[Literal["stimulus_side", "stimulus_contrast", "choice", "reward"]] = None,
     window_length: float = 1.0,
     batch_size: int = 16,
     seed: int = 0,
@@ -391,6 +404,7 @@ def get_loaders(
         dir_path: Root directory containing the dataset subdirectory.
         recording_ids: List of h5 file stems to include. Must be provided.
         readout_id: Name of the readout modality (e.g. ``"wheel_velocity"``).
+        task: Optional task name to filter sampling intervals (e.g. ``"choice"``).
         window_length: Sliding-window length in seconds.
         batch_size: Samples per batch.
         seed: Random seed for the training sampler.
@@ -438,9 +452,10 @@ def get_loaders(
     num_workers = 0 if not use_multiproc else 4
 
     train_sampler = RandomFixedWindowSampler(
-        sampling_intervals=dataset.get_sampling_intervals("train"),
+        sampling_intervals=dataset.get_sampling_intervals("train", task=task),
         window_length=window_length,
         generator=torch.Generator().manual_seed(seed),
+        drop_short=True,
     )
     train_loader = DataLoader(
         dataset=dataset,
@@ -453,8 +468,9 @@ def get_loaders(
     )
 
     val_sampler = SequentialFixedWindowSampler(
-        sampling_intervals=dataset.get_sampling_intervals("valid"),
+        sampling_intervals=dataset.get_sampling_intervals("valid", task=task),
         window_length=window_length,
+        drop_short=True,
     )
     val_loader = DataLoader(
         dataset=dataset,
@@ -467,8 +483,9 @@ def get_loaders(
     )
 
     test_sampler = SequentialFixedWindowSampler(
-        sampling_intervals=dataset.get_sampling_intervals("test"),
+        sampling_intervals=dataset.get_sampling_intervals("test", task=task),
         window_length=window_length,
+        drop_short=True,
     )
     test_loader = DataLoader(
         dataset=dataset,
