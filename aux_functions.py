@@ -10,6 +10,11 @@ import h5py
 import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+from sklearn.metrics import (
+    matthews_corrcoef,
+    balanced_accuracy_score,
+    roc_auc_score,
+)
 from temporaldata import Data, IrregularTimeSeries
 from torch_brain.dataset import Dataset, SpikingDatasetMixin
 from torch_brain.data import collate
@@ -72,7 +77,7 @@ class IBLBrainWideMapDataset(SpikingDatasetMixin, Dataset):
     def get_sampling_intervals(
         self,
         split: Optional[Literal["train", "valid", "test"]] = None,
-        task: Optional[Literal["stimulus_side", "stimulus_contrast", "choice", "reward", "wheel_movement"]] = None,
+        task: Optional[str] = None,
     ):
         """Return per-recording sampling intervals, optionally filtered by split and task.
 
@@ -122,7 +127,7 @@ def download_model(local_path: str = None):
 
 
 def compute_normalization_stats(
-    dir_path: str,
+    dir_path,
     recording_ids: list[str],
     readout_id: str,
     dirname: str = "ibl_processed",
@@ -249,7 +254,64 @@ def compute_r2(dataloader, model):
     return r2.item(), total_target, total_pred
 
 
-def training_step(batch, model, optimizer):
+def compute_classification_metrics(dataloader, model):
+    """Compute MCC, balanced accuracy and AUROC for a classification model.
+
+    Analogous to :func:`compute_r2` for regression models.
+
+    Args:
+        dataloader: A :class:`torch.utils.data.DataLoader` whose batches have
+            ``"model_inputs"`` and ``"target_values"`` (integer class indices).
+        model: A trained :class:`~mlp.MLPNeuralClassifier` instance.
+
+    Returns:
+        dict with keys ``"mcc"``, ``"bal_acc"``, and ``"auroc"``.
+    """
+
+    model.eval()
+    all_preds, all_probs, all_targets = [], [], []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            batch  = move_to_device(batch)
+            logits = model(**batch["model_inputs"])          # (B, num_classes)
+            probs  = torch.softmax(logits, dim=-1)[:, 1]    # P(positive class)
+            pred   = logits.argmax(dim=-1)
+            all_preds.append(pred.cpu())
+            all_probs.append(probs.cpu())
+            all_targets.append(batch["target_values"].cpu())
+
+    preds   = torch.cat(all_preds).numpy()
+    probs   = torch.cat(all_probs).numpy()
+    targets = torch.cat(all_targets).numpy()
+
+    return {
+        "mcc":      float(matthews_corrcoef(targets, preds)),
+        "bal_acc":  float(balanced_accuracy_score(targets, preds)),
+        "auroc":    float(roc_auc_score(targets, probs)),
+    }
+
+
+def training_step(
+    batch,
+    model,
+    optimizer,
+    task_type: Optional[Literal["regression", "classification"]] = "regression",
+):
+    """Perform a single training step.
+
+    Args:
+        batch: Batch dict from the DataLoader (must have ``"model_inputs"`` and
+            ``"target_values"`` keys).
+        model: The model to train.
+        optimizer: Optimizer instance.
+        task_type: ``"regression"`` uses MSE loss (default); ``"classification"``
+            uses cross-entropy loss (expects ``target_values`` to be integer class
+            indices of dtype ``torch.long``).
+
+    Returns:
+        Scalar loss tensor.
+    """
     # Step 0. Clear old gradients
     optimizer.zero_grad()
 
@@ -259,12 +321,15 @@ def training_step(batch, model, optimizer):
     # Step 1. Do forward pass
     pred = model(**inputs)
 
-    # shapes: [B, T, 1] -> [B, T]
-    if pred.dim() == 3 and pred.size(-1) == 1:
-        pred = pred.squeeze(-1)
-
     # Step 2. Compute loss
-    loss = F.mse_loss(pred, target)
+    if task_type == "regression":
+        # shapes: [B, T, 1] -> [B, T]
+        if pred.dim() == 3 and pred.size(-1) == 1:
+            pred = pred.squeeze(-1)
+        loss = F.mse_loss(pred, target)
+    else:  # classification
+        # pred: (B, num_classes)  target: (B,) long
+        loss = F.cross_entropy(pred, target.long())
 
     # Step 3. Backward pass
     loss.backward()
@@ -380,10 +445,10 @@ def finetune(model, optimizer, train_loader, val_loader, num_epochs=50, epoch_to
 
 
 def get_loaders(
-    dir_path: str = ".",
+    dir_path = ".",
     recording_ids: list[str] = None,
     readout_id: str = "wheel_velocity",
-    task: Optional[Literal["stimulus_side", "stimulus_contrast", "choice", "reward"]] = None,
+    task: Optional[str] = None,
     window_length: float = 1.0,
     batch_size: int = 16,
     seed: int = 0,
