@@ -40,6 +40,39 @@ parser.add_argument("--interval_ref_time", type=str, default="start_time")
 parser.add_argument("--interval_max_duration", type=float, default=None)
 
 
+TASKS_INTERVAL_REFERENCES = {
+    "stimulus_side": {
+        "ref_time_col": "gabor_stimulus_onset_time",
+        "ref_time_pre_window": 0.9,
+        "ref_time_post_window": 0.1,
+        "ref_value_col": "gabor_stimulus_side",
+    },
+    "stimulus_contrast": {
+        "ref_time_col": "gabor_stimulus_onset_time",
+        "ref_time_pre_window": 0.9,
+        "ref_time_post_window": 0.1,
+        "ref_value_col": "gabor_stimulus_contrast",
+    },
+    "choice": {
+        "ref_time_col": "wheel_movement_onset_time",
+        "ref_time_pre_window": 0.,
+        "ref_time_post_window": 1.,
+        "ref_value_col": "mouse_wheel_choice",
+    },
+    "reward": {
+        "ref_time_col": "feedback_time",
+        "ref_time_pre_window": 0.,
+        "ref_time_post_window": 1.,
+        "ref_value_col": "is_mouse_rewarded",
+    },
+    "wheel_movement": {
+        "ref_time_col": "gabor_stimulus_onset_time",
+        "ref_time_pre_window": 0.,
+        "ref_time_post_window": 1.,
+        "ref_value_col": None,
+    },
+}
+
 key_name_mapping = {
     # wheel_position
     "SpatialSeriesWheelPosition": "wheel_position",
@@ -222,6 +255,13 @@ class Pipeline(BrainsetPipeline):
         self.update_status("Extracting Trials")
         trials = extract_trials(nwbfile=nwbfile, max_time=max_time)
 
+        # Create event-based intervals
+        self.update_status("Creating Task-Aligned Intervals")
+        task_aligned_intervals = extract_task_aligned_intervals(
+            nwbfile=nwbfile,
+            max_time=max_time,
+        )
+
         # Create Data object
         data = Data(
             # Metadata
@@ -233,8 +273,9 @@ class Pipeline(BrainsetPipeline):
             units=units,
             spikes=spikes,
             domain="auto",
-            # Trials
+            # Intervals
             trials=trials,
+            task_aligned_intervals=task_aligned_intervals,
             # Behavior
             **wheel_data,
             **pose_estimation_data,
@@ -245,8 +286,6 @@ class Pipeline(BrainsetPipeline):
         train_trials, valid_trials, test_trials = extract_splits(
             nwbfile=nwbfile,
             max_time=max_time,
-            interval_ref_time=self.args.interval_ref_time,
-            interval_max_duration=self.args.interval_max_duration,
         )
         data.set_train_domain(train_trials)
         data.set_valid_domain(valid_trials)
@@ -463,21 +502,66 @@ def extract_trials(nwbfile: NWBFile, max_time: float):
     return trials
 
 
+def extract_task_aligned_intervals(nwbfile: NWBFile, max_time: float) -> Data:
+    """Build labeled time intervals anchored to per-trial events.
+
+    Uses the global ``TASKS_INTERVAL_REFERENCES``. Trials with
+    ``stop_time >= max_time`` are excluded upfront. Per task, trials
+    with a NaN reference event are additionally excluded.
+
+    Returns:
+        ``Data`` object with one ``Interval`` attribute per task.
+
+    Raises:
+        ValueError: If a ``ref_time_col`` or ``ref_value_col`` specified in
+            ``TASKS_INTERVAL_REFERENCES`` is not found in the trials table.
+    """
+    df = nwbfile.trials.to_dataframe()
+    df = df[df["stop_time"] < max_time]
+
+    task_intervals = {}
+
+    for task_name, spec in TASKS_INTERVAL_REFERENCES.items():
+        ref_time_col  = spec["ref_time_col"]
+        pre_window    = spec["ref_time_pre_window"]
+        post_window   = spec["ref_time_post_window"]
+        ref_value_col = spec["ref_value_col"]
+
+        if ref_time_col not in df.columns:
+            raise ValueError(
+                f"ref_time_col '{ref_time_col}' not found in trials table for task '{task_name}'"
+            )
+
+        if ref_value_col is not None and ref_value_col not in df.columns:
+            raise ValueError(
+                f"ref_value_col '{ref_value_col}' not found in trials table for task '{task_name}'"
+            )
+
+        ref_times  = df[ref_time_col].values.astype(float)
+        valid_mask = ~np.isnan(ref_times)
+
+        interval_kwargs = dict(
+            start=ref_times[valid_mask] - pre_window,
+            end=ref_times[valid_mask] + post_window,
+            trials_idx=df.index.values[valid_mask],
+        )
+        if ref_value_col is not None:
+            interval_kwargs[task_name] = df[ref_value_col].values[valid_mask]
+
+        task_intervals[task_name] = Interval(**interval_kwargs)
+
+    return Data(**task_intervals, domain="auto")
+
+
 def extract_splits(
     nwbfile: NWBFile,
     max_time: float,
-    interval_ref_time: str = "start_time",
-    interval_max_duration: float | None = None,
 ):
     """Extract train, validation and test splits for torch_brain."""
     df = nwbfile.trials.to_dataframe()    
-    df.rename(columns={interval_ref_time: "start", "stop_time": "end"}, inplace=True)
+    df.rename(columns={"start_time": "start", "stop_time": "end"}, inplace=True)
     df = df[df["end"] < max_time]
     df = df[["start", "end"]]
-
-    # Make intervals exactly match max_duration if specified
-    if interval_max_duration is not None:
-        df["end"] = df["start"] + interval_max_duration
 
     # Create intervals and split into train/valid/test
     selected_intervals = Interval.from_dataframe(
