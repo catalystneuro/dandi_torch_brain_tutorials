@@ -10,11 +10,7 @@ import h5py
 import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
-from sklearn.metrics import (
-    matthews_corrcoef,
-    balanced_accuracy_score,
-    roc_auc_score,
-)
+from sklearn.metrics import matthews_corrcoef
 from temporaldata import Data, IrregularTimeSeries
 from torch_brain.dataset import Dataset, SpikingDatasetMixin
 from torch_brain.data import collate
@@ -78,13 +74,21 @@ class IBLBrainWideMapDataset(SpikingDatasetMixin, Dataset):
         self,
         split: Optional[Literal["train", "valid", "test"]] = None,
         task: Optional[str] = None,
+        valid_labels: Optional[set] = None,
     ):
-        """Return per-recording sampling intervals, optionally filtered by split and task.
+        """Return per-recording sampling intervals, optionally filtered by split, task, and label.
 
         If ``task`` is provided, the returned intervals are the intersection of
         the split domain with ``task_aligned_intervals.<task>`` for each
         recording.  The sampler will then only draw windows from within those
         task-aligned portions of the selected split.
+
+        If ``valid_labels`` is also provided, only trial intervals whose label
+        (the per-trial attribute stored under the same name as ``task``) is a
+        member of ``valid_labels`` are kept.  Labels stored as bytes are
+        decoded to ``str`` before comparison.  This is the recommended way to
+        exclude trials with unseen labels (e.g. ``"no_go"``) from the sampler
+        so they never reach the model.
         """
         domain_key = "domain" if split is None else f"{split}_domain"
         result = {}
@@ -93,6 +97,14 @@ class IBLBrainWideMapDataset(SpikingDatasetMixin, Dataset):
             domain = getattr(recording, domain_key)
             if task is not None:
                 task_interval = getattr(recording.task_aligned_intervals, task)
+                if valid_labels is not None:
+                    trial_labels = getattr(task_interval, task)
+                    decoded = [
+                        lbl.decode() if isinstance(lbl, (bytes, np.bytes_)) else str(lbl)
+                        for lbl in trial_labels
+                    ]
+                    mask = np.array([lbl in valid_labels for lbl in decoded])
+                    task_interval = task_interval.select_by_mask(mask)
                 domain = domain & task_interval
             result[rid] = domain
         return result
@@ -269,27 +281,212 @@ def compute_classification_metrics(dataloader, model):
     """
 
     model.eval()
-    all_preds, all_probs, all_targets = [], [], []
+    all_preds, all_targets = [], []
 
     with torch.no_grad():
         for batch in dataloader:
             batch  = move_to_device(batch)
-            logits = model(**batch["model_inputs"])          # (B, num_classes)
-            probs  = torch.softmax(logits, dim=-1)[:, 1]    # P(positive class)
+            logits = model(**batch["model_inputs"])   # (B, num_classes)
             pred   = logits.argmax(dim=-1)
             all_preds.append(pred.cpu())
-            all_probs.append(probs.cpu())
             all_targets.append(batch["target_values"].cpu())
 
     preds   = torch.cat(all_preds).numpy()
-    probs   = torch.cat(all_probs).numpy()
     targets = torch.cat(all_targets).numpy()
 
     return {
-        "mcc":      float(matthews_corrcoef(targets, preds)),
-        "bal_acc":  float(balanced_accuracy_score(targets, preds)),
-        "auroc":    float(roc_auc_score(targets, probs)),
+        "mcc": float(matthews_corrcoef(targets, preds)),
     }
+
+
+def plot_cls_training_curves(cls_mcc_logs, cls_loss_logs, task=""):
+    """Plot validation MCC per epoch and training cross-entropy loss.
+
+    Args:
+        cls_mcc_logs: dict {label: list of MCC values (one per epoch + final)}.
+        cls_loss_logs: dict {label: list of loss values (one per training step)}.
+        task: Task name string used in the figure title.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+    for label in cls_mcc_logs:
+        axes[0].plot(cls_mcc_logs[label], label=label, marker="o", markersize=3)
+        axes[1].plot(cls_loss_logs[label], label=label, linewidth=0.8, alpha=0.85)
+    axes[0].set_title("Validation MCC per epoch", fontsize=12)
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("MCC")
+    axes[0].axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+    axes[1].set_title("Training cross-entropy loss", fontsize=12)
+    axes[1].set_xlabel("Training steps")
+    axes[1].set_ylabel("Cross-Entropy Loss")
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+    fig.suptitle(f"Training curves — task: {task}", fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+
+def run_cls_test(dataset, test_loader, cls_models, cls_unit_filters,
+                 device=None, transform_cls=None):
+    """Run test-set inference for all classification models and return metrics + predictions.
+
+    Args:
+        dataset: The shared :class:`IBLBrainWideMapDataset` instance.
+        test_loader: :class:`torch.utils.data.DataLoader` for the test split.
+        cls_models: dict ``{label: trained MLPNeuralClassifier}``.
+        cls_unit_filters: dict ``{label: UnitFilter}`` from the training loop.
+        device: Torch device.  Auto-detected if ``None``.
+        transform_cls: A callable that wraps ``[unit_filter, model.tokenize]``
+            into a single transform (typically
+            :class:`torch_brain.transforms.Compose`).
+
+    Returns:
+        ``(cls_test_metrics, cls_test_preds, cls_test_targets_arr)`` —
+        each a dict keyed by ``label``.
+    """
+    if device is None:
+        device = (
+            torch.device("mps") if torch.backends.mps.is_available()
+            else torch.device("cuda:0") if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+
+    cls_test_metrics, cls_test_preds, cls_test_targets_arr = {}, {}, {}
+
+    for label, m in cls_models.items():
+        if transform_cls is not None:
+            dataset.transform = transform_cls([cls_unit_filters[label], m.tokenize])
+        m.eval()
+        all_preds, all_targets = [], []
+        with torch.no_grad():
+            for batch in test_loader:
+                batch  = move_to_device(batch, device)
+                logits = m(**batch["model_inputs"])
+                all_preds.append(logits.argmax(dim=-1).cpu())
+                all_targets.append(batch["target_values"].cpu())
+
+        preds   = torch.cat(all_preds).numpy()
+        targets = torch.cat(all_targets).numpy()
+
+        cls_test_metrics[label]     = {"mcc": float(matthews_corrcoef(targets, preds))}
+        cls_test_preds[label]       = preds
+        cls_test_targets_arr[label] = targets
+        print(f"{label:15s}  MCC={cls_test_metrics[label]['mcc']:.3f}")
+
+    return cls_test_metrics, cls_test_preds, cls_test_targets_arr
+
+
+def plot_cls_mcc_bar(cls_test_metrics, task=""):
+    """Bar chart of test MCC per experiment (dashed line at 0 = chance).
+
+    Args:
+        cls_test_metrics: dict ``{label: {"mcc": float}}``.
+        task: Task name string used in the figure title.
+    """
+    labels_list = list(cls_test_metrics.keys())
+    mcc_vals    = [cls_test_metrics[l]["mcc"] for l in labels_list]
+    x = np.arange(len(labels_list))
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.bar(x, mcc_vals, color="steelblue")
+    ax.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels_list, fontsize=12)
+    ax.set_ylabel("MCC")
+    ax.set_title(f"Test MCC — task: {task}", fontsize=13)
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_cls_confusion_matrices(cls_test_metrics, cls_test_preds, cls_test_targets_arr,
+                                 task="", class_names=None):
+    """One confusion matrix per experiment, each subplot titled with its MCC.
+
+    Args:
+        cls_test_metrics: dict ``{label: {"mcc": float}}``.
+        cls_test_preds: dict ``{label: np.ndarray}`` of predicted class indices.
+        cls_test_targets_arr: dict ``{label: np.ndarray}`` of ground-truth class indices.
+        task: Task name string used in the suptitle.
+        class_names: List of two class-name strings (default ``["class 0", "class 1"]``).
+    """
+    from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+
+    if class_names is None:
+        class_names = ["class 0", "class 1"]
+
+    labels_list = list(cls_test_metrics.keys())
+    fig, axes = plt.subplots(1, len(labels_list), figsize=(4 * len(labels_list), 4))
+    if len(labels_list) == 1:
+        axes = [axes]
+
+    for ax, label in zip(axes, labels_list):
+        cm = confusion_matrix(cls_test_targets_arr[label], cls_test_preds[label])
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+        disp.plot(ax=ax, colorbar=False, cmap="Blues")
+        ax.set_title(f"{label}\nMCC={cls_test_metrics[label]['mcc']:.3f}", fontsize=11)
+
+    fig.suptitle(f"Confusion matrices — task: {task}", fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_population_mcc(population_results, task=""):
+    """Violin + swarm plot of test MCC distributions across sessions, one violin per region condition.
+
+    Each dot is one session; thin lines connect dots from the same session across conditions.
+    The dashed line at 0 marks chance level.
+
+    Args:
+        population_results: dict ``{session_id: {label: mcc_float}}``.
+        task: Task name string used in the figure title.
+    """
+    preferred_order = ["motor", "caudoputamen", "both"]
+    all_labels = {lbl for ses in population_results.values() for lbl in ses}
+    labels_list = [l for l in preferred_order if l in all_labels] + sorted(all_labels - set(preferred_order))
+    n_conditions = len(labels_list)
+
+    session_ids = list(population_results.keys())
+    data = np.full((len(session_ids), n_conditions), np.nan)
+    for i, sid in enumerate(session_ids):
+        for j, lbl in enumerate(labels_list):
+            data[i, j] = population_results[sid].get(lbl, np.nan)
+
+    fig, ax = plt.subplots(figsize=(4 + n_conditions, 5))
+    x_pos = np.arange(n_conditions)
+
+    # Violin
+    valid_cols = [data[:, j][~np.isnan(data[:, j])] for j in range(n_conditions)]
+    if any(len(c) > 1 for c in valid_cols):
+        parts = ax.violinplot(
+            [c if len(c) > 1 else np.array([c[0], c[0]]) for c in valid_cols],
+            positions=x_pos,
+            showmedians=True,
+            showextrema=True,
+        )
+        for pc in parts["bodies"]:
+            pc.set_alpha(0.35)
+
+    # Jittered individual dots + connecting lines across conditions per session
+    rng = np.random.default_rng(0)
+    for i in range(len(session_ids)):
+        jitter = rng.uniform(-0.06, 0.06, n_conditions)
+        row = data[i]
+        valid = ~np.isnan(row)
+        ax.plot(x_pos[valid] + jitter[valid], row[valid],
+                color="steelblue", alpha=0.45, linewidth=0.8, zorder=2)
+        ax.scatter(x_pos[valid] + jitter[valid], row[valid],
+                   color="steelblue", s=30, zorder=3, alpha=0.8)
+
+    ax.axhline(0, color="gray", linestyle="--", linewidth=0.9, alpha=0.7, label="Chance (MCC=0)")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels_list, fontsize=12)
+    ax.set_ylabel("Test MCC", fontsize=12)
+    ax.set_title(f"Population MCC — task: {task}\n(n={len(session_ids)} sessions)", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
 
 def training_step(
@@ -449,6 +646,7 @@ def get_loaders(
     recording_ids: list[str] = None,
     readout_id: str = "wheel_velocity",
     task: Optional[str] = None,
+    valid_labels: Optional[set] = None,
     window_length: float = 1.0,
     batch_size: int = 16,
     seed: int = 0,
@@ -457,7 +655,7 @@ def get_loaders(
 ):
     """Set up a single Dataset and three DataLoaders (train / val / test).
 
-    A *single* :class:`IBLBrainWideMapDataset` instance is created and shared
+    A single :class:`IBLBrainWideMapDataset` instance is created and shared
     across all three DataLoaders.  Each loader obtains its own sampler built
     from the appropriate split intervals (``"train"``, ``"valid"``, ``"test"``).
 
@@ -470,6 +668,11 @@ def get_loaders(
         recording_ids: List of h5 file stems to include. Must be provided.
         readout_id: Name of the readout modality (e.g. ``"wheel_velocity"``).
         task: Optional task name to filter sampling intervals (e.g. ``"choice"``).
+        valid_labels: Optional set of label strings to include when ``task`` is
+            set.  Trial intervals whose label (stored under the same key as
+            ``task``) is **not** in this set are excluded from the sampler,
+            so they never reach the model.  Pass ``set(LABEL_MAP.keys())``
+            to silently discard ``"no_go"`` and any other unlabelled trials.
         window_length: Sliding-window length in seconds.
         batch_size: Samples per batch.
         seed: Random seed for the training sampler.
@@ -517,7 +720,7 @@ def get_loaders(
     num_workers = 0 if not use_multiproc else 4
 
     train_sampler = RandomFixedWindowSampler(
-        sampling_intervals=dataset.get_sampling_intervals("train", task=task),
+        sampling_intervals=dataset.get_sampling_intervals("train", task=task, valid_labels=valid_labels),
         window_length=window_length,
         generator=torch.Generator().manual_seed(seed),
         drop_short=True,
@@ -533,7 +736,7 @@ def get_loaders(
     )
 
     val_sampler = SequentialFixedWindowSampler(
-        sampling_intervals=dataset.get_sampling_intervals("valid", task=task),
+        sampling_intervals=dataset.get_sampling_intervals("valid", task=task, valid_labels=valid_labels),
         window_length=window_length,
         drop_short=True,
     )
@@ -548,7 +751,7 @@ def get_loaders(
     )
 
     test_sampler = SequentialFixedWindowSampler(
-        sampling_intervals=dataset.get_sampling_intervals("test", task=task),
+        sampling_intervals=dataset.get_sampling_intervals("test", task=task, valid_labels=valid_labels),
         window_length=window_length,
         drop_short=True,
     )
