@@ -10,6 +10,7 @@ import h5py
 import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+from sklearn.metrics import matthews_corrcoef
 from temporaldata import Data, IrregularTimeSeries
 from torch_brain.dataset import Dataset, SpikingDatasetMixin
 from torch_brain.data import collate
@@ -72,13 +73,41 @@ class IBLBrainWideMapDataset(SpikingDatasetMixin, Dataset):
     def get_sampling_intervals(
         self,
         split: Optional[Literal["train", "valid", "test"]] = None,
+        task: Optional[str] = None,
+        valid_labels: Optional[set] = None,
     ):
-        """Return per-recording sampling intervals, optionally filtered by split."""
+        """Return per-recording sampling intervals, optionally filtered by split, task, and label.
+
+        If ``task`` is provided, the returned intervals are the intersection of
+        the split domain with ``task_aligned_intervals.<task>`` for each
+        recording.  The sampler will then only draw windows from within those
+        task-aligned portions of the selected split.
+
+        If ``valid_labels`` is also provided, only trial intervals whose label
+        (the per-trial attribute stored under the same name as ``task``) is a
+        member of ``valid_labels`` are kept.  Labels stored as bytes are
+        decoded to ``str`` before comparison.  This is the recommended way to
+        exclude trials with unseen labels (e.g. ``"no_go"``) from the sampler
+        so they never reach the model.
+        """
         domain_key = "domain" if split is None else f"{split}_domain"
-        return {
-            rid: getattr(self.get_recording(rid), domain_key)
-            for rid in self.recording_ids
-        }
+        result = {}
+        for rid in self.recording_ids:
+            recording = self.get_recording(rid)
+            domain = getattr(recording, domain_key)
+            if task is not None:
+                task_interval = getattr(recording.task_aligned_intervals, task)
+                if valid_labels is not None:
+                    trial_labels = getattr(task_interval, task)
+                    decoded = [
+                        lbl.decode() if isinstance(lbl, (bytes, np.bytes_)) else str(lbl)
+                        for lbl in trial_labels
+                    ]
+                    mask = np.array([lbl in valid_labels for lbl in decoded])
+                    task_interval = task_interval.select_by_mask(mask)
+                domain = domain & task_interval
+            result[rid] = domain
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +139,7 @@ def download_model(local_path: str = None):
 
 
 def compute_normalization_stats(
-    dir_path: str,
+    dir_path,
     recording_ids: list[str],
     readout_id: str,
     dirname: str = "ibl_processed",
@@ -185,6 +214,28 @@ def r2_score(y_pred, y_true):
     return r2
 
 
+def pearson_r(y_pred, y_true):
+    """Compute the Pearson correlation coefficient between two 1-D tensors.
+
+    Returns ``NaN`` when either signal has near-zero variance (e.g. a quiet
+    window where the mouse is stationary), rather than producing the large
+    negative values that R² can produce in those cases.
+
+    Args:
+        y_pred: Predicted values, shape ``(N,)``.
+        y_true: Ground-truth values, shape ``(N,)``.
+
+    Returns:
+        Scalar tensor in ``[-1, 1]``, or ``NaN`` if variance is too low.
+    """
+    pred_z   = y_pred - y_pred.mean()
+    true_z   = y_true - y_true.mean()
+    denom    = pred_z.norm() * true_z.norm()
+    if denom < 1e-6:
+        return torch.tensor(float("nan"))
+    return (pred_z * true_z).sum() / denom
+
+
 def compute_r2(dataloader, model):
     model.eval()  # turn off dropout, etc.
     total_target = []
@@ -215,7 +266,249 @@ def compute_r2(dataloader, model):
     return r2.item(), total_target, total_pred
 
 
-def training_step(batch, model, optimizer):
+def compute_classification_metrics(dataloader, model):
+    """Compute MCC, balanced accuracy and AUROC for a classification model.
+
+    Analogous to :func:`compute_r2` for regression models.
+
+    Args:
+        dataloader: A :class:`torch.utils.data.DataLoader` whose batches have
+            ``"model_inputs"`` and ``"target_values"`` (integer class indices).
+        model: A trained :class:`~mlp.MLPNeuralClassifier` instance.
+
+    Returns:
+        dict with keys ``"mcc"``, ``"bal_acc"``, and ``"auroc"``.
+    """
+
+    model.eval()
+    all_preds, all_targets = [], []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            batch  = move_to_device(batch)
+            logits = model(**batch["model_inputs"])   # (B, num_classes)
+            pred   = logits.argmax(dim=-1)
+            all_preds.append(pred.cpu())
+            all_targets.append(batch["target_values"].cpu())
+
+    preds   = torch.cat(all_preds).numpy()
+    targets = torch.cat(all_targets).numpy()
+
+    return {
+        "mcc": float(matthews_corrcoef(targets, preds)),
+    }
+
+
+def plot_cls_training_curves(cls_mcc_logs, cls_loss_logs, task=""):
+    """Plot validation MCC per epoch and training cross-entropy loss.
+
+    Args:
+        cls_mcc_logs: dict {label: list of MCC values (one per epoch + final)}.
+        cls_loss_logs: dict {label: list of loss values (one per training step)}.
+        task: Task name string used in the figure title.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+    for label in cls_mcc_logs:
+        axes[0].plot(cls_mcc_logs[label], label=label, marker="o", markersize=3)
+        axes[1].plot(cls_loss_logs[label], label=label, linewidth=0.8, alpha=0.85)
+    axes[0].set_title("Validation MCC per epoch", fontsize=12)
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("MCC")
+    axes[0].axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+    axes[1].set_title("Training cross-entropy loss", fontsize=12)
+    axes[1].set_xlabel("Training steps")
+    axes[1].set_ylabel("Cross-Entropy Loss")
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+    fig.suptitle(f"Training curves — task: {task}", fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+
+def run_cls_test(dataset, test_loader, cls_models, cls_unit_filters,
+                 device=None, transform_cls=None):
+    """Run test-set inference for all classification models and return metrics + predictions.
+
+    Args:
+        dataset: The shared :class:`IBLBrainWideMapDataset` instance.
+        test_loader: :class:`torch.utils.data.DataLoader` for the test split.
+        cls_models: dict ``{label: trained MLPNeuralClassifier}``.
+        cls_unit_filters: dict ``{label: UnitFilter}`` from the training loop.
+        device: Torch device.  Auto-detected if ``None``.
+        transform_cls: A callable that wraps ``[unit_filter, model.tokenize]``
+            into a single transform (typically
+            :class:`torch_brain.transforms.Compose`).
+
+    Returns:
+        ``(cls_test_metrics, cls_test_preds, cls_test_targets_arr)`` —
+        each a dict keyed by ``label``.
+    """
+    if device is None:
+        device = (
+            torch.device("mps") if torch.backends.mps.is_available()
+            else torch.device("cuda:0") if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+
+    cls_test_metrics, cls_test_preds, cls_test_targets_arr = {}, {}, {}
+
+    for label, m in cls_models.items():
+        if transform_cls is not None:
+            dataset.transform = transform_cls([cls_unit_filters[label], m.tokenize])
+        m.eval()
+        all_preds, all_targets = [], []
+        with torch.no_grad():
+            for batch in test_loader:
+                batch  = move_to_device(batch, device)
+                logits = m(**batch["model_inputs"])
+                all_preds.append(logits.argmax(dim=-1).cpu())
+                all_targets.append(batch["target_values"].cpu())
+
+        preds   = torch.cat(all_preds).numpy()
+        targets = torch.cat(all_targets).numpy()
+
+        cls_test_metrics[label]     = {"mcc": float(matthews_corrcoef(targets, preds))}
+        cls_test_preds[label]       = preds
+        cls_test_targets_arr[label] = targets
+        print(f"{label:15s}  MCC={cls_test_metrics[label]['mcc']:.3f}")
+
+    return cls_test_metrics, cls_test_preds, cls_test_targets_arr
+
+
+def plot_cls_mcc_bar(cls_test_metrics, task=""):
+    """Bar chart of test MCC per experiment (dashed line at 0 = chance).
+
+    Args:
+        cls_test_metrics: dict ``{label: {"mcc": float}}``.
+        task: Task name string used in the figure title.
+    """
+    labels_list = list(cls_test_metrics.keys())
+    mcc_vals    = [cls_test_metrics[l]["mcc"] for l in labels_list]
+    x = np.arange(len(labels_list))
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.bar(x, mcc_vals, color="steelblue")
+    ax.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels_list, fontsize=12)
+    ax.set_ylabel("MCC")
+    ax.set_title(f"Test MCC — task: {task}", fontsize=13)
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_cls_confusion_matrices(cls_test_metrics, cls_test_preds, cls_test_targets_arr,
+                                 task="", class_names=None):
+    """One confusion matrix per experiment, each subplot titled with its MCC.
+
+    Args:
+        cls_test_metrics: dict ``{label: {"mcc": float}}``.
+        cls_test_preds: dict ``{label: np.ndarray}`` of predicted class indices.
+        cls_test_targets_arr: dict ``{label: np.ndarray}`` of ground-truth class indices.
+        task: Task name string used in the suptitle.
+        class_names: List of two class-name strings (default ``["class 0", "class 1"]``).
+    """
+    from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+
+    if class_names is None:
+        class_names = ["class 0", "class 1"]
+
+    labels_list = list(cls_test_metrics.keys())
+    fig, axes = plt.subplots(1, len(labels_list), figsize=(4 * len(labels_list), 4))
+    if len(labels_list) == 1:
+        axes = [axes]
+
+    for ax, label in zip(axes, labels_list):
+        cm = confusion_matrix(cls_test_targets_arr[label], cls_test_preds[label])
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+        disp.plot(ax=ax, colorbar=False, cmap="Blues")
+        ax.set_title(f"{label}\nMCC={cls_test_metrics[label]['mcc']:.3f}", fontsize=11)
+
+    fig.suptitle(f"Confusion matrices — task: {task}", fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_population_mcc(population_results, task=""):
+    """Violin + swarm plot of test MCC distributions across sessions, one violin per region condition.
+
+    Each dot is one session; thin lines connect dots from the same session across conditions.
+    The dashed line at 0 marks chance level.
+
+    Args:
+        population_results: dict ``{session_id: {label: mcc_float}}``.
+        task: Task name string used in the figure title.
+    """
+    preferred_order = ["motor", "caudoputamen", "both"]
+    all_labels = {lbl for ses in population_results.values() for lbl in ses}
+    labels_list = [l for l in preferred_order if l in all_labels] + sorted(all_labels - set(preferred_order))
+    n_conditions = len(labels_list)
+
+    session_ids = list(population_results.keys())
+    data = np.full((len(session_ids), n_conditions), np.nan)
+    for i, sid in enumerate(session_ids):
+        for j, lbl in enumerate(labels_list):
+            data[i, j] = population_results[sid].get(lbl, np.nan)
+
+    fig, ax = plt.subplots(figsize=(4 + n_conditions, 5))
+    x_pos = np.arange(n_conditions)
+
+    # Violin
+    valid_cols = [data[:, j][~np.isnan(data[:, j])] for j in range(n_conditions)]
+    if any(len(c) > 1 for c in valid_cols):
+        parts = ax.violinplot(
+            [c if len(c) > 1 else np.array([c[0], c[0]]) for c in valid_cols],
+            positions=x_pos,
+            showmedians=True,
+            showextrema=True,
+        )
+        for pc in parts["bodies"]:
+            pc.set_alpha(0.35)
+
+    # Jittered individual dots + connecting lines across conditions per session
+    rng = np.random.default_rng(0)
+    for i in range(len(session_ids)):
+        jitter = rng.uniform(-0.06, 0.06, n_conditions)
+        row = data[i]
+        valid = ~np.isnan(row)
+        ax.plot(x_pos[valid] + jitter[valid], row[valid],
+                color="steelblue", alpha=0.45, linewidth=0.8, zorder=2)
+        ax.scatter(x_pos[valid] + jitter[valid], row[valid],
+                   color="steelblue", s=30, zorder=3, alpha=0.8)
+
+    ax.axhline(0, color="gray", linestyle="--", linewidth=0.9, alpha=0.7, label="Chance (MCC=0)")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels_list, fontsize=12)
+    ax.set_ylabel("Test MCC", fontsize=12)
+    ax.set_title(f"Population MCC — task: {task}\n(n={len(session_ids)} sessions)", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def training_step(
+    batch,
+    model,
+    optimizer,
+    task_type: Optional[Literal["regression", "classification"]] = "regression",
+):
+    """Perform a single training step.
+
+    Args:
+        batch: Batch dict from the DataLoader (must have ``"model_inputs"`` and
+            ``"target_values"`` keys).
+        model: The model to train.
+        optimizer: Optimizer instance.
+        task_type: ``"regression"`` uses MSE loss (default); ``"classification"``
+            uses cross-entropy loss (expects ``target_values`` to be integer class
+            indices of dtype ``torch.long``).
+
+    Returns:
+        Scalar loss tensor.
+    """
     # Step 0. Clear old gradients
     optimizer.zero_grad()
 
@@ -225,12 +518,15 @@ def training_step(batch, model, optimizer):
     # Step 1. Do forward pass
     pred = model(**inputs)
 
-    # shapes: [B, T, 1] -> [B, T]
-    if pred.dim() == 3 and pred.size(-1) == 1:
-        pred = pred.squeeze(-1)
-
     # Step 2. Compute loss
-    loss = F.mse_loss(pred, target)
+    if task_type == "regression":
+        # shapes: [B, T, 1] -> [B, T]
+        if pred.dim() == 3 and pred.size(-1) == 1:
+            pred = pred.squeeze(-1)
+        loss = F.mse_loss(pred, target)
+    else:  # classification
+        # pred: (B, num_classes)  target: (B,) long
+        loss = F.cross_entropy(pred, target.long())
 
     # Step 3. Backward pass
     loss.backward()
@@ -346,9 +642,11 @@ def finetune(model, optimizer, train_loader, val_loader, num_epochs=50, epoch_to
 
 
 def get_loaders(
-    dir_path: str = ".",
+    dir_path = ".",
     recording_ids: list[str] = None,
     readout_id: str = "wheel_velocity",
+    task: Optional[str] = None,
+    valid_labels: Optional[set] = None,
     window_length: float = 1.0,
     batch_size: int = 16,
     seed: int = 0,
@@ -357,7 +655,7 @@ def get_loaders(
 ):
     """Set up a single Dataset and three DataLoaders (train / val / test).
 
-    A *single* :class:`IBLBrainWideMapDataset` instance is created and shared
+    A single :class:`IBLBrainWideMapDataset` instance is created and shared
     across all three DataLoaders.  Each loader obtains its own sampler built
     from the appropriate split intervals (``"train"``, ``"valid"``, ``"test"``).
 
@@ -369,6 +667,12 @@ def get_loaders(
         dir_path: Root directory containing the dataset subdirectory.
         recording_ids: List of h5 file stems to include. Must be provided.
         readout_id: Name of the readout modality (e.g. ``"wheel_velocity"``).
+        task: Optional task name to filter sampling intervals (e.g. ``"choice"``).
+        valid_labels: Optional set of label strings to include when ``task`` is
+            set.  Trial intervals whose label (stored under the same key as
+            ``task``) is **not** in this set are excluded from the sampler,
+            so they never reach the model.  Pass ``set(LABEL_MAP.keys())``
+            to silently discard ``"no_go"`` and any other unlabelled trials.
         window_length: Sliding-window length in seconds.
         batch_size: Samples per batch.
         seed: Random seed for the training sampler.
@@ -416,9 +720,10 @@ def get_loaders(
     num_workers = 0 if not use_multiproc else 4
 
     train_sampler = RandomFixedWindowSampler(
-        sampling_intervals=dataset.get_sampling_intervals("train"),
+        sampling_intervals=dataset.get_sampling_intervals("train", task=task, valid_labels=valid_labels),
         window_length=window_length,
         generator=torch.Generator().manual_seed(seed),
+        drop_short=True,
     )
     train_loader = DataLoader(
         dataset=dataset,
@@ -431,8 +736,9 @@ def get_loaders(
     )
 
     val_sampler = SequentialFixedWindowSampler(
-        sampling_intervals=dataset.get_sampling_intervals("valid"),
+        sampling_intervals=dataset.get_sampling_intervals("valid", task=task, valid_labels=valid_labels),
         window_length=window_length,
+        drop_short=True,
     )
     val_loader = DataLoader(
         dataset=dataset,
@@ -445,8 +751,9 @@ def get_loaders(
     )
 
     test_sampler = SequentialFixedWindowSampler(
-        sampling_intervals=dataset.get_sampling_intervals("test"),
+        sampling_intervals=dataset.get_sampling_intervals("test", task=task, valid_labels=valid_labels),
         window_length=window_length,
+        drop_short=True,
     )
     test_loader = DataLoader(
         dataset=dataset,
@@ -693,13 +1000,10 @@ def plot_test_intervals(test_results, n_intervals=5, order: Literal["top", "bott
             else:
                 r2_parts.append(f"{r2:.3f}")
         
-        # Add average R² if multi-model
         if is_multi_model:
-            avg_r2 = avg_r2_scores[idx]
-            r2_parts.append(f"avg: {avg_r2:.3f}")
-            title_text = f"R² - {' | '.join(r2_parts)}"
+            title_text = f"r - {' | '.join(r2_parts)}"
         else:
-            title_text = f"R² = {r2_parts[0]}"
+            title_text = f"r = {r2_parts[0]}"
         
         # Formatting
         ax.set_title(title_text, fontsize=12, fontweight='bold')
